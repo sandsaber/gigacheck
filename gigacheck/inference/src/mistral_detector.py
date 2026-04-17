@@ -6,12 +6,14 @@ from loguru import logger
 from intervaltree import Interval, IntervalTree
 
 from transformers import (
+    AutoConfig,
     AutoTokenizer,
-    PretrainedConfig,
     PreTrainedTokenizer,
 )
 
-from gigacheck.model.mistral_ai_detector import MistralAIDetectorForSequenceClassification
+from gigacheck.model.mistral_ai_detector import (
+    MistralAIDetectorForSequenceClassification,
+)
 from gigacheck.model.src.interval_detector.span_utils import span_cxw_to_xx
 
 
@@ -46,24 +48,34 @@ class MistralDetector:
         return self._max_len
 
     def _from_pretrained_multitask(self, base_model_path, device_map, **kwargs):
+        device_map = self._resolve_device_map(device_map)
         if self.with_detr:
             model = self._from_pretrained_detr(base_model_path, device_map, **kwargs)
         else:
-            model = self._from_pretrained_classifier(base_model_path, device_map, **kwargs)
+            model = self._from_pretrained_classifier(
+                base_model_path, device_map, **kwargs
+            )
 
         return model
 
+    @staticmethod
+    def _resolve_device_map(device_map: str) -> str:
+        if device_map in ("cpu", "mps"):
+            return device_map
+        if device_map.startswith("cuda:") or device_map.startswith("hip:"):
+            return device_map
+        return device_map
+
     def _from_pretrained_detr(self, base_model_path, device_map, **kwargs):
-        pretrain_conf = PretrainedConfig.from_pretrained(base_model_path)
+        pretrain_conf = AutoConfig.from_pretrained(base_model_path)
+        if not hasattr(pretrain_conf, "max_length") or pretrain_conf.max_length is None:
+            pretrain_conf.max_length = self._max_len
         detr_config = pretrain_conf.detr_config
-        num_labels = pretrain_conf.num_labels
 
         if pretrain_conf.to_dict().get("trained_classification_head", True) is False:
             self.trained_classification_head = False
 
         additional_kwargs = {
-            "num_labels": num_labels,
-            "max_length": self._max_len,
             "with_detr": self.with_detr,
             "detr_config": detr_config,
             "device_map": device_map,
@@ -71,42 +83,61 @@ class MistralDetector:
         }
         additional_kwargs.update(kwargs)
 
-        model = MistralAIDetectorForSequenceClassification.from_pretrained(base_model_path, **additional_kwargs)
+        model = MistralAIDetectorForSequenceClassification.from_pretrained(
+            base_model_path, config=pretrain_conf, **additional_kwargs
+        )
+        model.config.max_length = self._max_len
 
         extractor_dtype = getattr(torch, pretrain_conf.detr_config["extractor_dtype"])
         logger.info(f"Using dtype={extractor_dtype} for {type(model.model)}")
         if extractor_dtype == torch.bfloat16:
-            model.model.to(torch.bfloat16)
-            model.classification_head.to(torch.bfloat16)
+            if device_map not in ("cpu",):
+                model.model.to(torch.bfloat16)
+                model.classification_head.to(torch.bfloat16)
+            else:
+                logger.info("Skipping bfloat16 cast on CPU device")
 
         return model
 
     def _from_pretrained_classifier(self, base_model_path, device_map, **kwargs):
-        pretrain_conf = PretrainedConfig.from_pretrained(base_model_path)
-        num_labels = pretrain_conf.num_labels
+        pretrain_conf = AutoConfig.from_pretrained(base_model_path)
+        if not hasattr(pretrain_conf, "max_length") or pretrain_conf.max_length is None:
+            pretrain_conf.max_length = self._max_len
 
-        assert num_labels, "Number of labels must be not 0."
+        assert pretrain_conf.num_labels, "Number of labels must be not 0."
 
         additional_kwargs = {
-            "num_labels": num_labels,
-            "max_length": self._max_len,
             "with_detr": self.with_detr,
             "device_map": device_map,
             "torch_dtype": "auto",
         }
         additional_kwargs.update(kwargs)
-        model = MistralAIDetectorForSequenceClassification.from_pretrained(base_model_path, **additional_kwargs)
+        model = MistralAIDetectorForSequenceClassification.from_pretrained(
+            base_model_path, config=pretrain_conf, **additional_kwargs
+        )
+        model.config.max_length = self._max_len
 
         return model
 
-    def from_pretrained(self, base_model_path, model: MistralAIDetectorForSequenceClassification = None, **kwargs):
+    def from_pretrained(
+        self,
+        base_model_path,
+        model: MistralAIDetectorForSequenceClassification = None,
+        **kwargs,
+    ):
         self.tokenizer = AutoTokenizer.from_pretrained(base_model_path)
 
         if model is None:
             device_map = self.device
-            self.model = self._from_pretrained_multitask(base_model_path, device_map, **kwargs)
+            self.model = self._from_pretrained_multitask(
+                base_model_path, device_map, **kwargs
+            )
+            if device_map in ("cpu", "mps"):
+                self.model = self.model.to(device_map)
 
-            logger.info(f"{self.model.dtype=} max_len: {self._max_len}")
+            logger.info(
+                f"{self.model.dtype=} max_len: {self._max_len} device: {device_map}"
+            )
         else:
             self.model = model
 
@@ -121,49 +152,69 @@ class MistralDetector:
         return self
 
     def _get_tokens(self, text: str) -> Tuple[torch.tensor, torch.tensor, int, int]:
-        assert self._max_len is not None and self.tokenizer is not None, "Model must be initialized"
+        assert self._max_len is not None and self.tokenizer is not None, (
+            "Model must be initialized"
+        )
 
         tokens = self.tokenizer(text, add_special_tokens=False).input_ids
         n_tokens = len(tokens)
 
         if len(tokens) > self._max_len - 2:
             tokens = tokens[: self._max_len - 2]
-            cur_text = self.tokenizer.convert_tokens_to_string(self.tokenizer.convert_ids_to_tokens(tokens))
+            cur_text = self.tokenizer.convert_tokens_to_string(
+                self.tokenizer.convert_ids_to_tokens(tokens)
+            )
             text_len = len(cur_text)
         else:
             text_len = len(text)
 
-        tokens = torch.tensor([self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id])
+        tokens = torch.tensor(
+            [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
+        )
         used_tokens = len(tokens)
 
         tokens = tokens.unsqueeze(0)
         mask = torch.ones_like(tokens)
 
         if n_tokens > self._max_len - 2:
-            logger.debug(f"Use only {used_tokens} tokens from {n_tokens} ({len(text.split(' '))} all words)")
+            logger.debug(
+                f"Use only {used_tokens} tokens from {n_tokens} ({len(text.split(' '))} all words)"
+            )
 
         logger.debug(f"Use tokens: {used_tokens}. Max tokens: {self._max_len}")
 
         return tokens.to(self.device), mask.to(self.device), text_len, n_tokens
 
-    def _get_ai_intervals(self, detr_out: Dict[str, torch.Tensor], text_lens: List[int]) -> List[np.ndarray]:
+    def _get_ai_intervals(
+        self, detr_out: Dict[str, torch.Tensor], text_lens: List[int]
+    ) -> List[np.ndarray]:
         pred_spans = detr_out["pred_spans"].detach()
-        src_logits = detr_out["pred_logits"].detach()  # (batch_size, #queries, #classes=2)
+        src_logits = detr_out[
+            "pred_logits"
+        ].detach()  # (batch_size, #queries, #classes=2)
         assert len(text_lens) == pred_spans.shape[0]
 
         # take probs for foreground objects only (ind = 0)
         pred_probs = torch.softmax(src_logits, -1)[:, :, 0:1]
-        spans = torch.stack([to_absolete(pred_spans[i], text_lens[i]) for i in range(len(text_lens))], dim=0)
+        spans = torch.stack(
+            [to_absolete(pred_spans[i], text_lens[i]) for i in range(len(text_lens))],
+            dim=0,
+        )
 
         # concat spans and scores
         preds = torch.cat([spans, pred_probs], dim=2)  # xx, prob
-        final_preds = [text_preds[text_preds[:, 2] > self.conf_interval_thresh].cpu().numpy() for text_preds in preds]
+        final_preds = [
+            text_preds[text_preds[:, 2] > self.conf_interval_thresh].cpu().numpy()
+            for text_preds in preds
+        ]
 
         return final_preds
 
     @torch.no_grad()
     def predict(self, text: str) -> Dict[str, Any]:
-        assert self.model is not None, "Model must be initialized, call from_pretrained() method."
+        assert self.model is not None, (
+            "Model must be initialized, call from_pretrained() method."
+        )
 
         tokens, mask, text_len, n_tokens = self._get_tokens(text)
 
@@ -187,7 +238,9 @@ class MistralDetector:
         else:
             # ai / human / mixed classification
             main_logits, detr_out = output.logits
-            ai_intervals: List[np.ndarray] = self._get_ai_intervals(detr_out, [text_len])
+            ai_intervals: List[np.ndarray] = self._get_ai_intervals(
+                detr_out, [text_len]
+            )
             ai_intervals = ai_intervals[0]
 
             if self.trained_classification_head:
@@ -196,9 +249,11 @@ class MistralDetector:
                 main_probs = main_probs[0]
                 cls_ind = int(np.argmax(main_probs))
                 pred_label = self.id2label[cls_ind]
-                return {"pred_label": pred_label,
-                        "classification_head_probs": main_probs,
-                        "ai_intervals": ai_intervals}
+                return {
+                    "pred_label": pred_label,
+                    "classification_head_probs": main_probs,
+                    "ai_intervals": ai_intervals,
+                }
             else:
                 return {"ai_intervals": ai_intervals}
 
@@ -209,7 +264,9 @@ def to_absolete(pred_spans: torch.Tensor, text_len: int) -> torch.Tensor:
 
 
 def merge_intervals(ai_intervals: np.ndarray) -> List[Tuple[int, int]]:
-    intervals = IntervalTree(Interval(begin, end, prob) for (begin, end, prob) in ai_intervals)
+    intervals = IntervalTree(
+        Interval(begin, end, prob) for (begin, end, prob) in ai_intervals
+    )
     intervals.merge_overlaps(strict=False)
     ai_intervals = [(int(i.begin), int(i.end)) for i in sorted(intervals)]
     return ai_intervals

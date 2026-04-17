@@ -9,7 +9,11 @@ import transformers
 from transformers import AutoTokenizer, PreTrainedTokenizer, AutoConfig
 from transformers.trainer_utils import set_seed, EvalPrediction
 
-from gigacheck.train.src.detection.arguments_parsing import DataArguments, ModelArguments, TrainingArguments
+from gigacheck.train.src.detection.arguments_parsing import (
+    DataArguments,
+    ModelArguments,
+    TrainingArguments,
+)
 from gigacheck.train.src.detection.interval_dataset import IntervalEncodedDataset
 from gigacheck.train.src.detection.detr_trainer import DetrTrainer
 
@@ -18,38 +22,62 @@ from gigacheck.train.src.data.data_format import TextSample
 from gigacheck.train.src.data.utils import Input
 from gigacheck.train.src.utils import print_trainable_parameters, save_config
 
-from gigacheck.model.mistral_ai_detector import MistralAIDetectorForSequenceClassification
-from gigacheck.model.src.interval_detector.metrics.intervals_metrics import AveragePrecision
-from gigacheck.model.src.interval_detector.metrics.sentence_metrics import SentenceMetrics
-from gigacheck.model.src.interval_detector.span_utils import gt_to_absolete, convert_outputs
+from gigacheck.model.mistral_ai_detector import (
+    MistralAIDetectorForSequenceClassification,
+)
+from gigacheck.model.src.interval_detector.metrics.intervals_metrics import (
+    AveragePrecision,
+)
+from gigacheck.model.src.interval_detector.metrics.sentence_metrics import (
+    SentenceMetrics,
+)
+from gigacheck.model.src.interval_detector.span_utils import (
+    gt_to_absolete,
+    convert_outputs,
+)
+from gigacheck.device_utils import resolve_attn_implementation
 
 
-def compute_metrics(eval_pred: EvalPrediction, eval_dataset: IntervalEncodedDataset) -> Dict[str, float]:
+def compute_metrics(
+    eval_pred: EvalPrediction, eval_dataset: IntervalEncodedDataset
+) -> Dict[str, float]:
     # model predictions: (all_pred_spans, all_pred_logits);
     all_pred_spans, all_pred_logits = eval_pred.predictions
     # meta info about samples: (all_text_lengths, all_text_inds, n_gt_spans)
     all_text_lengths, all_text_inds = eval_pred.label_ids
-    assert len(all_text_lengths) == len(all_pred_logits) == len(all_pred_spans) == len(all_text_inds)
+    assert (
+        len(all_text_lengths)
+        == len(all_pred_logits)
+        == len(all_pred_spans)
+        == len(all_text_inds)
+    )
 
     map_metric = AveragePrecision()
     sentence_metric = SentenceMetrics()
 
     # iterate over all eval dataset
     for pred_logits, pred_spans, text_length, text_ind in zip(
-        all_pred_logits, all_pred_spans, all_text_lengths, all_text_inds,
+        all_pred_logits,
+        all_pred_spans,
+        all_text_lengths,
+        all_text_inds,
     ):
         pred_spans = torch.tensor(pred_spans)
         pred_logits = torch.tensor(pred_logits)
         span_labels = eval_dataset.__getitem__(text_ind).span_labels
 
-        gt_spans = gt_to_absolete(span_labels, text_length) if len(span_labels) > 0 else span_labels
+        gt_spans = (
+            gt_to_absolete(span_labels, text_length)
+            if len(span_labels) > 0
+            else span_labels
+        )
         preds = convert_outputs(pred_logits, pred_spans, text_length)
         # preds = filter_by_thresh(preds, thresh=0.1)
 
         map_metric.update(
             [{"pred_relevant_windows": preds, "text_id": text_ind}],
             [{"relevant_windows": gt_spans, "text_id": text_ind}],
-            text_length
+            text_length,
         )
         sample = eval_dataset.texts[text_ind]
         sentence_metric.update(preds, gt_spans, sample.text, sample.sep_indices)
@@ -112,14 +140,21 @@ def load_model(
 ) -> MistralAIDetectorForSequenceClassification:
 
     if training_args.bf16:
-        raise NotImplementedError("BF16 is not yet implemented. You can set --extractor_dtype 'bfloat16'.")
+        raise NotImplementedError(
+            "BF16 is not yet implemented. You can set --extractor_dtype 'bfloat16'."
+        )
+
+    attn_implementation = resolve_attn_implementation(training_args.attn_implementation)
+    logger.info(f"Using attention implementation: {attn_implementation}")
 
     kwargs = {"token": model_args.hf_token} if model_args.hf_token else {}
-    arch_name = AutoConfig.from_pretrained(model_args.pretrained_model_name, **kwargs).architectures[-1]
+    arch_name = AutoConfig.from_pretrained(
+        model_args.pretrained_model_name, **kwargs
+    ).architectures[-1]
 
-    # train only detr model, backbone is always frozen here
     model = MistralAIDetectorForSequenceClassification.from_pretrained(  # type: ignore
         pretrained_model_name_or_path=model_args.pretrained_model_name,
+        attn_implementation=attn_implementation,
         with_detr=True,
         freeze_backbone=True,
         detr_config=model_args.to_dict(),
@@ -158,12 +193,16 @@ def load_model(
 
 
 def train():
-    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    parser = transformers.HfArgumentParser(
+        (ModelArguments, DataArguments, TrainingArguments)
+    )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     set_seed(training_args.seed)
     kwargs = {"token": model_args.hf_token} if model_args.hf_token else {}
-    tokenizer = AutoTokenizer.from_pretrained(model_args.pretrained_model_name, **kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.pretrained_model_name, **kwargs
+    )
     update_tokenizer(tokenizer, data_args.max_sequence_length)
 
     train_dataset, eval_dataset = load_datasets(
@@ -176,8 +215,15 @@ def train():
 
     model = load_model(model_args, training_args, tokenizer)
 
-    save_config(model.config, model_args.pretrained_model_name, model_args.id2label, training_args.output_dir)
-    logger.info(f"***** Running DETR training for {training_args.num_train_epochs} epochs *****")
+    save_config(
+        model.config,
+        model_args.pretrained_model_name,
+        model_args.id2label,
+        training_args.output_dir,
+    )
+    logger.info(
+        f"***** Running DETR training for {training_args.num_train_epochs} epochs *****"
+    )
 
     log_extra_losses = list(model.criterion.weight_dict.keys())
     trainer = DetrTrainer(

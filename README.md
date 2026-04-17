@@ -15,9 +15,35 @@
 
 ### Install:
 
+**CPU-only:**
 ```bash
 pip install -U setuptools
-pip install -e . && pip install flash-attn==2.7.3 --no-build-isolation
+pip install -e .
+```
+
+**CUDA (12.6):**
+```bash
+pip install -U setuptools
+pip install -e . --extra-index-url https://download.pytorch.org/whl/cu126
+```
+
+**ROCm 7.2 (AMD GPU):**
+```bash
+pip install -U setuptools
+pip install -e . --extra-index-url https://download.pytorch.org/whl/rocm7.2
+```
+
+> **Note:** ROCm 7.2+ is required for gfx1151 (Radeon 8060S / STRIX Halo). ROCm 7.1 wheels have known kernel issues on RDNA 3.5 GPUs.
+
+**macOS (Apple Silicon via MPS):**
+```bash
+pip install -U setuptools
+pip install -e .
+```
+
+**Optional: NVIDIA Flash Attention 2** (for RTX 4090, A100, H100):
+```bash
+pip install -e ".[nvidia-fa2]"
 ```
 
 ### Train classification model
@@ -34,13 +60,13 @@ You need to have a dataset in '.jsonl' file. Each line in the following format:
 }
 ```
 
-#### Training
+#### Training (CUDA)
 
 ```bash
 deepspeed gigacheck/train/scripts/train_classification_model.py \
     --deepspeed ${ROOT_DIR}/gigacheck/deepspeed_configs/zero2.json \
     --pretrained_model_name "mistralai/Mistral-7B-v0.3" \
-    --attn_implementation "flash_attention_2" \
+    --attn_implementation "flex_attention" \
     --train_data_path "/data/classification/train.jsonl" \
     --eval_data_path "/data/classification/valid.jsonl" \
     --max_sequence_length 1024 \
@@ -77,6 +103,17 @@ deepspeed gigacheck/train/scripts/train_classification_model.py \
     --full_determinism True
 ```
 
+#### Training (ROCm)
+
+Same as CUDA training but use the ROCm entry point and DeepSpeed config:
+```bash
+deepspeed gigacheck/train/scripts/train_classification_model_rocm.py \
+    --deepspeed ${ROOT_DIR}/gigacheck/deepspeed_configs/zero2_rocm.json \
+    --attn_implementation "sdpa" \
+    ... (same arguments as above)
+```
+
+> **Note:** ROCm training requires PyTorch built with ROCm 7.2+ support. Set `ROCM_PATH` if installed in a non-default location.
 
 #### Save the model with merged LoRA weights
 
@@ -105,7 +142,7 @@ You need to have a dataset in '.jsonl' file. Each line in the following format:
 
 > **NOTE:** We provide the **CoAuthor** dataset converted into our specific format for training and validation. The original data (sourced from [minalee-research/coauthor-interface](https://github.com/minalee-research/coauthor-interface)) has been pre-processed to match the schema described below. You can download the ready-to-use files here: [link](https://drive.google.com/drive/folders/1jnEdqJh5mN-luh4VAy3G-8HEJuYfp9Vl).
 
-#### Training
+#### Training (CUDA)
 
 ```bash
 accelerate launch --num_processes 8 gigacheck/train/scripts/train_detr_model.py \
@@ -150,19 +187,55 @@ accelerate launch --num_processes 8 gigacheck/train/scripts/train_detr_model.py 
     --report_to tensorboard
 ```
 
+#### Training (ROCm)
+
+```bash
+accelerate launch --num_processes 8 gigacheck/train/scripts/train_detr_model_rocm.py \
+    --attn_implementation "sdpa" \
+    ... (same arguments as above)
+```
 
 ### Inference example
 
 ```bash
-CUDA_VISIBLE_DEVICES="0" \
+# Auto-detect device (CUDA -> ROCm -> MPS -> CPU)
 python3 gigacheck/inference/inference.py \
 --text "${TEXT}" \
 --model_path ${model_path}
+
+# Specify device explicitly
+python3 gigacheck/inference/inference.py \
+--text "${TEXT}" \
+--model_path ${model_path} \
+--device cuda:0
+
+# CPU-only inference
+python3 gigacheck/inference/inference.py \
+--text "${TEXT}" \
+--model_path ${model_path} \
+--device cpu
+
+# macOS (Apple Silicon)
+python3 gigacheck/inference/inference.py \
+--text "${TEXT}" \
+--model_path ${model_path} \
+--device mps
 ```
+
+### Supported Backends
+
+| Backend | Training | Inference | Attention |
+|---------|----------|-----------|-----------|
+| NVIDIA CUDA | DeepSpeed ZeRO | Yes | flex_attention, sdpa, flash_attention_2, eager |
+| AMD ROCm 7.2 | DeepSpeed ZeRO | Yes | flex_attention, sdpa, eager |
+| Apple MPS | Limited | Yes | eager |
+| CPU | Limited | Yes | eager |
+
+> **Note:** ROCm 7.1 wheels have known segfaults on RDNA 3.5 (gfx1151) GPUs. Use ROCm 7.2+ wheels (`--index-url https://download.pytorch.org/whl/rocm7.2`).
 
 ### License
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) 
 
 Source code, model weights and datasets are licensed under the **Apache License 2.0**. 
 

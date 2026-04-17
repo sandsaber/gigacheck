@@ -1,30 +1,37 @@
 from pathlib import Path
 
-import pkg_resources as pkg
 from setuptools import find_packages, setup
 
-# Settings
 FILE = Path(__file__).resolve()
-PARENT = FILE.parent  # root directory
+PARENT = FILE.parent
 README = (PARENT / "README.md").read_text(encoding="utf-8")
-REQUIREMENTS = [f"{x.name}{x.specifier}" for x in pkg.parse_requirements((PARENT / "requirements.txt").read_text())]
 
+REQUIREMENTS = [
+    line.strip()
+    for line in (PARENT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.startswith("#")
+]
+
+EXTRAS_REQUIRE = {
+    "nvidia-fa2": ["flash-attn>=2.7.3"],
+}
 
 exec(open("gigacheck/version.py").read())
 setup(
-    name="gigacheck",  # name of pypi package
-    version=__version__,  # version of pypi package # noqa: F821 # type: ignore
+    name="gigacheck",
+    version=__version__,  # noqa: F821
     python_requires=">=3.11",
-    description="",
+    description="GigaCheck: Detecting LLM-generated Content",
     long_description=README,
     long_description_content_type="text/markdown",
     url="",
     project_urls={},
     author="Layer Team, SberAI",
     author_email="",
-    packages=find_packages(include=["gigacheck", "gigacheck.*"]),  # required
+    packages=find_packages(include=["gigacheck", "gigacheck.*"]),
     include_package_data=True,
     install_requires=REQUIREMENTS,
+    extras_require=EXTRAS_REQUIRE,
     classifiers=[
         "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
@@ -33,6 +40,7 @@ setup(
         "License :: Attribution-ShareAlike 4.0",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
         "Topic :: Software Development",
         "Topic :: Scientific/Engineering",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
