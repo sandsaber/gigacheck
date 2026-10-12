@@ -78,7 +78,12 @@ class MistralDetector:
         additional_kwargs = {
             "with_detr": self.with_detr,
             "detr_config": detr_config,
-            "device_map": device_map,
+            # Load on CPU and let the bf16 cast below run there too — casting
+            # resident fp32 weights on MPS segfaults inside
+            # MetalShaderLibrary::exec_unary_kernel (torch 2.14.x, Apple
+            # Silicon). The outer from_pretrained() then moves the finished
+            # bf16 model to the target device with a plain copy.
+            "device_map": "cpu",
             "torch_dtype": torch.float32,
         }
         additional_kwargs.update(kwargs)
